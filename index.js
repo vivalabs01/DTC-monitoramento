@@ -18,6 +18,23 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
+// O Neon (serverless) derruba conexões ociosas de tempos em tempos (autosuspend/reciclagem
+// do pooler). Sem este handler, um erro num cliente idle do pool vira uma exceção não
+// tratada que derruba o processo inteiro. Aqui só logamos e seguimos — o pg cria uma
+// conexão nova automaticamente na próxima query.
+pool.on("error", (err) => {
+  console.error("[PG POOL] erro em conexão ociosa (ignorado, processo continua):", err.message);
+});
+
+// Rede de segurança geral: qualquer erro assíncrono que escape dos try/catch normais
+// (ex: uma Promise rejeitada sem .catch) também não deve derrubar o serviço inteiro.
+process.on("unhandledRejection", (err) => {
+  console.error("[UNHANDLED REJECTION] (ignorado, processo continua):", err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[UNCAUGHT EXCEPTION] (ignorado, processo continua):", err);
+});
+
 async function query(sql, params = []) {
   const client = await pool.connect();
   try {
