@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 import { execSync } from "child_process";
-import cron from "node-cron";
 import pg from "pg";
 
 const { Pool } = pg;
@@ -139,6 +138,17 @@ function getChromiumPath() {
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
   try {
+    // PILAR 1: Interceptação de Rede (Network Blocking)
+    // Aborta o download de imagens, vídeos, css e fontes pesadas da Meta Ad Library para economizar 70% de RAM e CPU.
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["image", "media", "font", "stylesheet"].includes(type)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
+    });
+
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(15000);
     const content = await page.content();
@@ -343,15 +353,6 @@ async function runLote(itens) {
   }
 }
 
-function resolveSlot(trigger) {
-  switch (trigger) {
-    case "cron-03h": return 3;
-    case "cron-12h": return 12;
-    case "cron-22h": return 22;
-    default: return null;
-  }
-}
-
 async function mirrorToSheet(rows) {
   const url = process.env.SHEET_WEBHOOK_URL;
   if (!url) return;
@@ -365,6 +366,80 @@ async function mirrorToSheet(rows) {
   } catch (err) {
     console.error(`[SHEET] mirror failed: ${err.message}`);
   }
+}
+
+function getCurrentSlot() {
+  const now = new Date();
+  const hour = now.getUTCHours();
+  if (hour >= 1 && hour < 6) return 22;
+  if (hour >= 6 && hour < 15) return 3;
+  return 12;
+}
+
+async function processBatch(pages, slot) {
+  let browser;
+  let context;
+  const results = [];
+
+  async function launchBrowser() {
+    if (browser) await browser.close();
+    browser = await chromium.launch({
+      executablePath: getChromiumPath(),
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    });
+    context = await browser.newContext({
+      locale: "pt-BR",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
+    });
+  }
+
+  try {
+    await launchBrowser(); // Início limpo
+
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+
+      let count = null;
+      for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
+        try {
+          count = await scrapeWithContext(context, p.url);
+        } catch (err) {
+          console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+        }
+      }
+      const final = count ?? 0;
+
+      if (slot !== null && slot !== undefined) {
+        await saveCount(p.slug, final, slot);
+      } else {
+        await query(
+          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (slug) DO UPDATE
+             SET ads_count    = EXCLUDED.ads_count,
+                 collected_at = EXCLUDED.collected_at`,
+          [p.slug, final]
+        );
+        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
+      }
+
+      results.push({ slug: p.slug, nome: p.nome, count: final });
+
+      // Delay tático entre páginas
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (err) {
+    console.error(`[BATCH] fatal error: ${err.message}`);
+  } finally {
+    if (browser) await browser.close();
+  }
+
+  if (results.length > 0) {
+    await mirrorToSheet(results);
+  }
+  return results;
 }
 
 let isRunning = false;
@@ -427,79 +502,44 @@ function parseLoteInput(texto) {
   return itens;
 }
 
-async function runAllScrapes(trigger = "cron") {
-  if (isRunning) {
-    console.warn(`[RUN] skipped (${trigger}) — already running`);
-    return { skipped: true };
-  }
-  isRunning = true;
-  const startedAt = new Date();
-  console.log(`[RUN] ===== started (${trigger}) at ${startedAt.toISOString()} =====`);
-
-  const { rows: pages } = await query("SELECT slug, nome, url FROM pages");
-  if (!pages.length) {
-    console.log("[RUN] no pages registered");
-    isRunning = false;
-    return { pages: 0 };
-  }
-
-  let browser;
-  const results = [];
-  try {
-    browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-    });
-    const context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
-    for (const p of pages) {
-      let count = null;
-      for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-        try {
-          count = await scrapeWithContext(context, p.url);
-        } catch (err) {
-          console.error(`[RUN] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
-        }
-      }
-      const final = count ?? 0;
-
-      if (trigger.startsWith("cron")) {
-        const slot = resolveSlot(trigger);
-        await saveCount(p.slug, final, slot);
-      } else {
-        await query(
-          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-           VALUES ($1, $2, NOW())
-           ON CONFLICT (slug) DO UPDATE
-             SET ads_count    = EXCLUDED.ads_count,
-                 collected_at = EXCLUDED.collected_at`,
-          [p.slug, final]
-        );
-        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
-      }
-
-      results.push({ slug: p.slug, nome: p.nome, count: final });
-    }
-  } catch (err) {
-    console.error(`[RUN] fatal error: ${err.message}`);
-  } finally {
-    if (browser) await browser.close();
-    isRunning = false;
-  }
-
-  await mirrorToSheet(results);
-  const secs = Math.round((Date.now() - startedAt.getTime()) / 1000);
-  console.log(`[RUN] ===== finished (${trigger}) — ${results.length} pages in ${secs}s =====`);
-  return { pages: results.length, durationSec: secs, results };
-}
-
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
+
+app.get("/api/cron/tick", async (req, res) => {
+  res.json({ status: "alive", message: "Tick received" });
+
+  if (isRunning) return;
+  isRunning = true;
+
+  try {
+    const slot = getCurrentSlot();
+    const { rows: pages } = await query(`
+      SELECT p.slug, p.nome, p.url
+      FROM pages p
+      WHERE NOT EXISTS (
+        SELECT 1 FROM scrape_history sh 
+        WHERE sh.slug = p.slug 
+          AND sh.slot = $1 
+          AND sh.collected_at >= NOW() - INTERVAL '8 hours'
+      )
+      LIMIT 5;
+    `, [slot]);
+
+    if (pages.length === 0) {
+      isRunning = false;
+      return;
+    }
+
+    console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
+    await processBatch(pages, slot);
+    console.log(`[TICK] Lote do slot ${slot} finalizado.`);
+  } catch (err) {
+    console.error("[TICK] Erro geral:", err);
+  } finally {
+    isRunning = false;
+  }
+});
 
 app.post("/api/salvar", async (req, res) => {
   const { nome, url, tipo, instagram_url, geo, nicho, funil, brand, ads_count_inicial } = req.body;
@@ -574,7 +614,39 @@ app.get("/api/coletar/:slug", async (req, res) => {
 
 app.get("/api/coletar-tudo", async (_req, res) => {
   res.json({ status: "started" });
-  runAllScrapes("manual").catch((e) => console.error("[RUN] manual error:", e.message));
+
+  if (isRunning) {
+    console.warn("[RUN] coleta-tudo abortada — já existe uma coleta em andamento (cron ou outro lote)");
+    return;
+  }
+  isRunning = true;
+
+  (async () => {
+    try {
+      const { rows: pages } = await query(`SELECT slug, nome, url FROM pages`);
+      if (pages.length === 0) {
+        console.log("[RUN] coleta-tudo: nenhuma página cadastrada");
+        return;
+      }
+
+      const CHUNK_SIZE = 5; // mesmo tamanho de lote usado pelo cron — navegador é reiniciado a cada lote
+      console.log(`[RUN] coleta-tudo manual iniciada — ${pages.length} páginas, em lotes de ${CHUNK_SIZE}`);
+
+      let processadas = 0;
+      for (let i = 0; i < pages.length; i += CHUNK_SIZE) {
+        const lote = pages.slice(i, i + CHUNK_SIZE);
+        await processBatch(lote, null);
+        processadas += lote.length;
+        console.log(`[RUN] coleta-tudo progresso: ${processadas}/${pages.length}`);
+      }
+
+      console.log(`[RUN] coleta-tudo manual finalizada — ${pages.length} páginas`);
+    } catch (e) {
+      console.error("[RUN] manual error:", e.message);
+    } finally {
+      isRunning = false;
+    }
+  })();
 });
 
 app.get("/api/historico/:slug", async (req, res) => {
@@ -2524,11 +2596,8 @@ render(D_DOM,HD_DOM,"dom_");
 
 // ─── Scheduler ───────────────────────────────────────────────────────────────
 
-// Cron em UTC explícito: 03h BR=06h UTC | 12h BR=15h UTC | 22h BR=01h UTC
-cron.schedule("0 6 * * *",  () => runAllScrapes("cron-03h"), { timezone: "UTC" });
-cron.schedule("0 15 * * *", () => runAllScrapes("cron-12h"), { timezone: "UTC" });
-cron.schedule("0 1 * * *",  () => runAllScrapes("cron-22h"), { timezone: "UTC" });
-console.log("[CRON] scheduled 03h/12h/22h BRT = 06h/15h/01h UTC");
+// O agendamento agora é feito externamente via rota GET /api/cron/tick (ex: UptimeRobot a cada 5 min)
+console.log("[CRON] Usando arquitetura de Fila Assíncrona via /api/cron/tick");
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
