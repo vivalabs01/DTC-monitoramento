@@ -418,18 +418,36 @@ async function processBatch(pages, slot) {
     for (let i = 0; i < pages.length; i++) {
       const p = pages[i];
 
+      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
+      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
       let count = null;
-      for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-        try {
-          count = await scrapeWithContext(context, p.url);
-        } catch (err) {
-          console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+      let falhaMotivo = null;
+      if (!/^https?:\/\//i.test(p.url || "")) {
+        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
+        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
+      } else {
+        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
+          try {
+            count = await scrapeWithContext(context, p.url);
+          } catch (err) {
+            falhaMotivo = err.message;
+            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+          }
         }
       }
-      const final = count ?? 0;
+
+      // Coleta falhou de verdade (não achou o número, ou nem conseguiu abrir a página).
+      // NÃO salva 0 — isso viraria um dado falso no histórico. Só loga e pula o slug;
+      // ele será tentado de novo no próximo tick (mesmo slot, dentro da janela de 8h).
+      if (count === null) {
+        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
 
       if (slot !== null && slot !== undefined) {
-        await saveCount(p.slug, final, slot);
+        await saveCount(p.slug, count, slot);
       } else {
         await query(
           `INSERT INTO scrape_latest (slug, ads_count, collected_at)
@@ -437,12 +455,12 @@ async function processBatch(pages, slot) {
            ON CONFLICT (slug) DO UPDATE
              SET ads_count    = EXCLUDED.ads_count,
                  collected_at = EXCLUDED.collected_at`,
-          [p.slug, final]
+          [p.slug, count]
         );
-        console.log(`[LATEST] slug=${p.slug} count=${final} (manual — histórico preservado)`);
+        console.log(`[LATEST] slug=${p.slug} count=${count} (manual — histórico preservado)`);
       }
 
-      results.push({ slug: p.slug, nome: p.nome, count: final });
+      results.push({ slug: p.slug, nome: p.nome, count });
 
       // Delay tático entre páginas
       await new Promise(r => setTimeout(r, 1500));
@@ -453,8 +471,9 @@ async function processBatch(pages, slot) {
     if (browser) await browser.close();
   }
 
-  if (results.length > 0) {
-    await mirrorToSheet(results);
+  const resultsOk = results.filter((r) => r.count !== null);
+  if (resultsOk.length > 0) {
+    await mirrorToSheet(resultsOk);
   }
   return results;
 }
