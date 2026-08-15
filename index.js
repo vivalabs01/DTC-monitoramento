@@ -120,6 +120,33 @@ async function initDb() {
   await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_from ON funnel_edges(from_node_id)`);
   await query(`CREATE INDEX IF NOT EXISTS idx_funnel_edges_to ON funnel_edges(to_node_id)`);
 
+  // Migração: amplia o CHECK de funnel_nodes.tipo para incluir 'ads' e 'presell'.
+  // Em vez de depender de adivinhar o nome do constraint (que o Postgres gera
+  // automaticamente), o bloco DO $$ abaixo PROCURA dinamicamente qual é o CHECK
+  // constraint da coluna `tipo` e o remove, seja qual for o nome — depois recria
+  // com um nome fixo e conhecido (`funnel_nodes_tipo_check`). Isso é 100% seguro
+  // de rodar em todo restart: se não encontrar nenhum constraint, não faz nada;
+  // se encontrar, remove e recria com a lista ampliada.
+  await query(`
+    DO $$
+    DECLARE
+      c_name text;
+    BEGIN
+      SELECT conname INTO c_name
+      FROM pg_constraint
+      WHERE conrelid = 'funnel_nodes'::regclass
+        AND contype = 'c'
+        AND pg_get_constraintdef(oid) ILIKE '%tipo%';
+      IF c_name IS NOT NULL THEN
+        EXECUTE format('ALTER TABLE funnel_nodes DROP CONSTRAINT %I', c_name);
+      END IF;
+    END $$;
+  `);
+  await query(`
+    ALTER TABLE funnel_nodes ADD CONSTRAINT funnel_nodes_tipo_check
+    CHECK (tipo IN ('ads','advertorial','presell','tsl','vsl','quiz','whatsapp','checkout'))
+  `);
+
   console.log("[DB] Tables ready.");
 }
 
@@ -191,7 +218,25 @@ async function scrapeWithContext(context, url) {
       const parsed = parseInt(textMatch[1].replace(/[,.]/g, ""), 10);
       if (!isNaN(parsed)) return parsed;
     }
-    return null;
+
+    // DIAGNÓSTICO: antes disso retornava `null` sem motivo nenhum, e todo mundo
+    // virava "FALHA (motivo desconhecido)" no log — impossível saber se era bloqueio,
+    // captcha, cookie wall ou página vazia. Agora identificamos o sinal mais provável
+    // e jogamos isso pro log da próxima tentativa via exceção (falhaMotivo em processBatch).
+    const title = await page.title().catch(() => "");
+    const lower = bodyText.toLowerCase();
+    const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
+    let motivo = `texto "resultados/results" não encontrado — title="${title}"`;
+    if (lower.includes("checkpoint") || lower.includes("captcha") || lower.includes("unusual activity") || lower.includes("atividade incomum")) {
+      motivo = `possível checkpoint/captcha de segurança da Meta — title="${title}"`;
+    } else if (lower.includes("log in") || lower.includes("faça login") || lower.includes("entrar no facebook")) {
+      motivo = `possível bloqueio exigindo login — title="${title}"`;
+    } else if (lower.includes("cookie") && (lower.includes("aceit") || lower.includes("accept"))) {
+      motivo = `possível cookie/consent wall bloqueando o conteúdo — title="${title}"`;
+    } else if (bodyText.trim().length < 200) {
+      motivo = `página praticamente vazia (${bodyText.trim().length} chars) — possível bloqueio ou timeout de carregamento — title="${title}"`;
+    }
+    throw new Error(`${motivo} | snippet="${snippet}"`);
   } finally {
     await page.close();
   }
@@ -1100,14 +1145,16 @@ app.get("/api/lote/status", (_req, res) => {
 // ─── Funis (modelo de grafo: nós + conexões) ────────────────────────────────
 
 const TIPO_INFO = {
+  ads:         { icon: "📢", label: "ADS" },
   advertorial: { icon: "📄", label: "Advertorial" },
+  presell:     { icon: "🧲", label: "Presell" },
   tsl:         { icon: "📝", label: "TSL" },
   vsl:         { icon: "🎬", label: "VSL" },
   quiz:        { icon: "🧩", label: "Quiz" },
   whatsapp:    { icon: "💬", label: "WhatsApp" },
   checkout:    { icon: "💳", label: "Checkout" },
 };
-const TIPOS_ORDEM = ["advertorial", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
+const TIPOS_ORDEM = ["ads", "advertorial", "presell", "tsl", "vsl", "quiz", "whatsapp", "checkout"];
 
 // Computa todos os caminhos (raiz → folha) de um grafo de nós/conexões.
 // Raiz = nó sem conexão de entrada. Folha = nó sem conexão de saída.
@@ -2151,6 +2198,37 @@ app.get("/dashboard", async (_req, res) => {
     const dadosDom    = JSON.stringify(grupoDominios.geral);
     const histDadosDom = JSON.stringify(grupoDominios.hist);
 
+    // "📢 Mapeamento ADS": lê todo nó tipo='ads', conectado ou não, agrupado por página.
+    // Não depende de computarCaminhos() (que exige componente com 2+ nós) — um ADS
+    // cadastrado sozinho, sem conexão nenhuma, já aparece aqui.
+    const { rows: adsRows } = await query(`
+      SELECT fn.id, fn.rotulo, fn.url AS ad_url, p.slug, p.nome, p.tipo
+      FROM funnel_nodes fn
+      JOIN pages p ON p.slug = fn.slug
+      WHERE fn.tipo = 'ads'
+      ORDER BY p.nome, fn.created_at ASC
+    `);
+
+    const adsBySlug = {};
+    adsRows.forEach(r => {
+      (adsBySlug[r.slug] ||= { nome: r.nome, tipo: r.tipo, itens: [] })
+        .itens.push({ id: r.id, rotulo: r.rotulo, url: r.ad_url });
+    });
+    const adsPaginas = Object.values(adsBySlug).sort((a, b) => a.nome.localeCompare(b.nome));
+
+    const adsCardsHtml = adsPaginas.map(pg => `
+      <div class="player-card">
+        <div class="player-hdr">
+          <span class="player-tipo-badge ${pg.tipo === "dominio" ? "b-dom" : "b-pag"}">${pg.tipo === "dominio" ? "🌐" : "📡"}</span>
+          <span class="player-nome">${pg.nome}</span>
+          <span class="ads-count-badge">📢 ${pg.itens.length} ADS</span>
+        </div>
+        <div class="ads-chip-row">
+          ${pg.itens.map(a => `<a href="${a.url}" target="_blank" rel="noopener" class="chip" title="${a.rotulo}"><span class="chip-icon">📢</span><span class="chip-label">${a.rotulo}</span></a>`).join("")}
+        </div>
+      </div>
+    `).join("");
+
     // Serializa o SVG do Instagram para uso seguro dentro do template literal JS
     const IG_SVG_ESC = IG_SVG.replace(/`/g, "\\`").replace(/\$/g, "\\$");
 
@@ -2245,6 +2323,18 @@ tbody tr:hover td{background:var(--surface2)}
 .hist-slot.empty{color:var(--border)}
 .tbl-scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .group-title{font-size:15px;font-weight:700;color:#fff;letter-spacing:.4px;margin:0 0 16px 2px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.player-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+.player-hdr{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.player-tipo-badge{font-size:15px;padding:2px 6px;border-radius:6px}
+.player-nome{font-size:15px;font-weight:700;color:#fff;text-decoration:none}
+.b-dom{background:rgba(124,111,255,.15);color:#a78bfa}
+.b-pag{background:rgba(52,211,153,.12);color:#34d399}
+.chip{display:inline-flex;align-items:center;gap:5px;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:5px 10px;text-decoration:none;font-size:12px;font-weight:600;color:#fff}
+.chip:hover{border-color:var(--accent)}
+.chip-icon{font-size:13px}
+.chip-label{white-space:nowrap}
+.ads-count-badge{margin-left:auto;font-size:11px;font-weight:600;color:#a78bfa;background:rgba(167,139,250,.12);padding:3px 10px;border-radius:7px;white-space:nowrap}
+.ads-chip-row{display:flex;flex-wrap:wrap;gap:8px}
 @media(max-width:1100px){.grid-charts{grid-template-columns:1fr}.rosca-wrap{flex-direction:column}}
 @media(max-width:768px){
   body{padding:12px}
@@ -2357,6 +2447,13 @@ tbody tr:hover td{background:var(--surface2)}
   <span>O mapeamento completo de funis agora tem uma página dedicada.</span>
   <a href="/funis" style="font-size:13px;font-weight:600;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:8px 18px;border-radius:8px;white-space:nowrap">🔀 Abrir Mapa de Funis</a>
 </div>
+
+<div style="height:36px"></div>
+
+<div class="group-title">📢 Mapeamento ADS</div>
+${adsPaginas.length === 0
+  ? '<div class="empty-hint">Nenhum ADS mapeado ainda. Cadastre em Admin → 🔀 Funis → Nova Etapa (tipo ADS) — não precisa conectar a nada.</div>'
+  : `<div class="player-caminhos" style="margin-bottom:26px">${adsCardsHtml}</div>`}
 
 <div style="height:36px"></div>
 
