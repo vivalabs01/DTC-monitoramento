@@ -194,6 +194,26 @@ async function scrapeWithContext(context, url) {
     });
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+    // CORREÇÃO: as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
+    // diretamente — a Meta devolve uma página "casca" que redireciona via JS pro
+    // endereço real (o <meta http-equiv="refresh"> só existe como fallback pra
+    // navegadores sem JS, dentro de um <noscript> — por isso ele aparecia como
+    // TEXTO literal no bodyText, e não como um redirecionamento de fato seguido).
+    // Em vez de confiar que o JS do redirect roda sozinho no nosso contexto
+    // automatizado dentro da janela de espera, detectamos e seguimos manualmente.
+    for (let hop = 0; hop < 3; hop++) {
+      const refreshTarget = await page.evaluate(() => {
+        const meta = document.querySelector('meta[http-equiv="refresh" i]');
+        if (!meta) return null;
+        const m = (meta.getAttribute("content") || "").match(/url\s*=\s*(.+)$/i);
+        return m ? m[1].trim().replace(/^['"]|['"]$/g, "") : null;
+      }).catch(() => null);
+      if (!refreshTarget) break;
+      const nextUrl = new URL(refreshTarget, page.url()).toString();
+      await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    }
+
     await page.waitForTimeout(15000);
     const content = await page.content();
     const htmlMatch = content.match(/([\d.,]+)\s*(resultados|results)/i);
@@ -227,7 +247,15 @@ async function scrapeWithContext(context, url) {
     const lower = bodyText.toLowerCase();
     const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
     let motivo = `texto "resultados/results" não encontrado — title="${title}"`;
-    if (lower.includes("checkpoint") || lower.includes("captcha") || lower.includes("unusual activity") || lower.includes("atividade incomum")) {
+    // Checa isso ANTES do bloco genérico de palavras-chave — bodyText de uma SPA
+    // grande da Meta quase sempre contém "captcha"/"checkpoint"/"atividade incomum"
+    // em algum canto de boilerplate (rodapé, central de ajuda, textos ocultos),
+    // então casar essas palavras em QUALQUER lugar do texto dá falso positivo.
+    // Um <meta refresh> ainda presente como texto literal é sinal bem mais preciso:
+    // significa que ficamos presos numa página-casca de redirecionamento.
+    if (/http-equiv=["']refresh["']/i.test(bodyText)) {
+      motivo = `preso numa página de redirecionamento (meta refresh) que não completou mesmo após seguir manualmente — title="${title}"`;
+    } else if (lower.includes("checkpoint") || lower.includes("captcha") || lower.includes("unusual activity") || lower.includes("atividade incomum")) {
       motivo = `possível checkpoint/captcha de segurança da Meta — title="${title}"`;
     } else if (lower.includes("log in") || lower.includes("faça login") || lower.includes("entrar no facebook")) {
       motivo = `possível bloqueio exigindo login — title="${title}"`;
