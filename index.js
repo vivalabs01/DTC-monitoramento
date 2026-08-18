@@ -222,7 +222,15 @@ async function scrapeWithContext(context, url) {
         .replace(/&quot;/gi, '"')
         .replace(/&#0?39;/gi, "'");
       if (!refreshTarget) break;
-      const nextUrl = new URL(refreshTarget, page.url()).toString();
+      const nextUrlObj = new URL(refreshTarget, page.url());
+      // CORREÇÃO (v3): a URL de destino do <noscript> vem marcada com
+      // _fb_noscript=1 — o parâmetro que a própria Meta usa pra sinalizar
+      // "sirva a versão para cliente sem JavaScript". Nosso navegador roda JS
+      // normalmente; pedir essa URL como está devolve uma versão que não
+      // hidrata o número de resultados. Removemos o parâmetro pra pedir a
+      // versão completa, como um navegador comum pediria.
+      nextUrlObj.searchParams.delete("_fb_noscript");
+      const nextUrl = nextUrlObj.toString();
       console.log(`[SCRAPE] hop=${hop} seguindo meta-refresh -> ${nextUrl}`);
       await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     }
@@ -257,25 +265,39 @@ async function scrapeWithContext(context, url) {
     // captcha, cookie wall ou página vazia. Agora identificamos o sinal mais provável
     // e jogamos isso pro log da próxima tentativa via exceção (falhaMotivo em processBatch).
     const title = await page.title().catch(() => "");
-    const lower = bodyText.toLowerCase();
-    const snippet = bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
+    // CORREÇÃO (v3): para checkpoint/captcha/login/cookie/página-vazia usamos
+    // innerText (texto VISÍVEL renderizado), não textContent — textContent
+    // inclui o conteúdo bruto de <script> (o bootstrap JS da Meta, cheio de
+    // nomes de módulo tipo "require") e de <noscript>, então qualquer uma
+    // dessas palavras aparecendo em JS invisível ou boilerplate oculto virava
+    // falso positivo (era exatamente isso que estava acontecendo — o title
+    // continuava "Biblioteca de Anúncios" nesses casos, prova de que não era
+    // bloqueio de verdade). bodyText (textContent) continua sendo usado só no
+    // fallback de "resultados" acima e na detecção de <meta refresh> ainda
+    // preso abaixo — essas duas precisam enxergar conteúdo não-visível, é
+    // assim que a tag do noscript é encontrada quando ainda presos na casca.
+    const visibleText = (await page.innerText("body").catch(() => "")) ?? "";
+    const lower = visibleText.toLowerCase();
+    const snippetBruto = bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
+    const snippetVisivel = visibleText.replace(/\s+/g, " ").trim().slice(0, 200);
     let motivo = `texto "resultados/results" não encontrado — title="${title}"`;
-    // Checa isso ANTES do bloco genérico de palavras-chave — bodyText de uma SPA
-    // grande da Meta quase sempre contém "captcha"/"checkpoint"/"atividade incomum"
-    // em algum canto de boilerplate (rodapé, central de ajuda, textos ocultos),
-    // então casar essas palavras em QUALQUER lugar do texto dá falso positivo.
-    // Um <meta refresh> ainda presente como texto literal é sinal bem mais preciso:
-    // significa que ficamos presos numa página-casca de redirecionamento.
+    let snippet = snippetBruto;
+    // Checa o <meta refresh> ANTES do bloco de palavras-chave — continua sendo
+    // o sinal mais preciso de que ficamos presos numa página-casca.
     if (/http-equiv=["']refresh["']/i.test(bodyText)) {
       motivo = `preso numa página de redirecionamento (meta refresh) que não completou mesmo após seguir manualmente — title="${title}"`;
     } else if (lower.includes("checkpoint") || lower.includes("captcha") || lower.includes("unusual activity") || lower.includes("atividade incomum")) {
       motivo = `possível checkpoint/captcha de segurança da Meta — title="${title}"`;
+      snippet = snippetVisivel;
     } else if (lower.includes("log in") || lower.includes("faça login") || lower.includes("entrar no facebook")) {
       motivo = `possível bloqueio exigindo login — title="${title}"`;
+      snippet = snippetVisivel;
     } else if (lower.includes("cookie") && (lower.includes("aceit") || lower.includes("accept"))) {
       motivo = `possível cookie/consent wall bloqueando o conteúdo — title="${title}"`;
-    } else if (bodyText.trim().length < 200) {
-      motivo = `página praticamente vazia (${bodyText.trim().length} chars) — possível bloqueio ou timeout de carregamento — title="${title}"`;
+      snippet = snippetVisivel;
+    } else if (visibleText.trim().length < 200) {
+      motivo = `página praticamente vazia (${visibleText.trim().length} chars de conteúdo visível) — possível bloqueio ou timeout de carregamento — title="${title}"`;
+      snippet = snippetVisivel;
     }
     throw new Error(`${motivo} | snippet="${snippet}"`);
   } finally {
