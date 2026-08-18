@@ -195,22 +195,35 @@ async function scrapeWithContext(context, url) {
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-    // CORREÇÃO: as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
+    // CORREÇÃO (v2): as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
     // diretamente — a Meta devolve uma página "casca" que redireciona via JS pro
-    // endereço real (o <meta http-equiv="refresh"> só existe como fallback pra
-    // navegadores sem JS, dentro de um <noscript> — por isso ele aparecia como
-    // TEXTO literal no bodyText, e não como um redirecionamento de fato seguido).
-    // Em vez de confiar que o JS do redirect roda sozinho no nosso contexto
-    // automatizado dentro da janela de espera, detectamos e seguimos manualmente.
+    // endereço real. A tag <meta http-equiv="refresh"> de fallback fica DENTRO de
+    // um <noscript> — e com JavaScript habilitado (nosso caso), o navegador NUNCA
+    // materializa o conteúdo de um <noscript> como DOM real, só como texto inerte.
+    // A v1 desta correção usava document.querySelector no DOM e por isso NUNCA
+    // encontrava a tag — o hop só "funcionava" enquanto o redirect via JS de
+    // verdade completava sozinho por conta própria. Agora extraímos a tag direto
+    // do HTML bruto (page.content(), que inclui o texto do noscript) via regex,
+    // sem depender do DOM — funciona esteja a tag dentro de um <noscript> ou não.
     for (let hop = 0; hop < 3; hop++) {
-      const refreshTarget = await page.evaluate(() => {
-        const meta = document.querySelector('meta[http-equiv="refresh" i]');
-        if (!meta) return null;
-        const m = (meta.getAttribute("content") || "").match(/url\s*=\s*(.+)$/i);
-        return m ? m[1].trim().replace(/^['"]|['"]$/g, "") : null;
-      }).catch(() => null);
+      const htmlAtual = await page.content().catch(() => "");
+      const metaTagMatch = htmlAtual.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/i);
+      if (!metaTagMatch) break;
+      const contentAttrMatch = metaTagMatch[0].match(/content=["']([^"']*)["']/i);
+      const urlPartMatch = contentAttrMatch ? contentAttrMatch[1].match(/url\s*=\s*(.+)$/i) : null;
+      if (!urlPartMatch) break;
+      // Entidades HTML (&amp; etc.) precisam ser decodificadas manualmente aqui —
+      // ao contrário de meta.getAttribute() num DOM real, regex sobre HTML bruto
+      // devolve o texto exatamente como está serializado, sem decodificar nada.
+      const refreshTarget = urlPartMatch[1]
+        .trim()
+        .replace(/^['"]|['"]$/g, "")
+        .replace(/&amp;/gi, "&")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#0?39;/gi, "'");
       if (!refreshTarget) break;
       const nextUrl = new URL(refreshTarget, page.url()).toString();
+      console.log(`[SCRAPE] hop=${hop} seguindo meta-refresh -> ${nextUrl}`);
       await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
     }
 
