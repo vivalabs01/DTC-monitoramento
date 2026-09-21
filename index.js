@@ -44,6 +44,17 @@ async function query(sql, params = []) {
   }
 }
 
+// Garante que toda URL salva tenha esquema (http/https). Sem isso, o Playwright falha
+// ao tentar navegar ("Cannot navigate to invalid URL") e, em links renderizados no
+// front-end (<a href="...">), o navegador interpreta como caminho relativo e abre
+// dentro do próprio domínio do app (ex: "Cannot GET /dominio.com").
+function normalizeUrl(url) {
+  if (!url) return url;
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
 async function initDb() {
   await query(`
     CREATE TABLE IF NOT EXISTS pages (
@@ -87,16 +98,16 @@ async function initDb() {
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS geo TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS nicho TEXT`);
   await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS funil TEXT`);
-  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS brand TEXT`);
 
-  await query(`
-    CREATE TABLE IF NOT EXISTS brands (
-      id           SERIAL PRIMARY KEY,
-      nome         TEXT UNIQUE NOT NULL,
-      site         TEXT,
-      created_at   TIMESTAMP NOT NULL DEFAULT NOW()
-    )
-  `);
+  // FIX (fila travada / starvation do cron): coluna que registra a última tentativa
+  // de coleta de cada página, sucesso OU falha. Sem isso, uma página com falha
+  // persistente nunca sai da lista de "pendentes" do slot (porque falha não grava em
+  // scrape_history) e, sem ORDER BY, a query do /api/cron/tick devolvia sempre as
+  // mesmas 5 páginas quebradas em todo tick — monopolizando o LIMIT 5 e impedindo
+  // qualquer outra página do slot de ser tentada. Ver uso em processBatch() e na
+  // query de /api/cron/tick.
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP`);
+  await query(`ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_status TEXT`);
 
   await query(`
     CREATE TABLE IF NOT EXISTS funnel_nodes (
@@ -179,127 +190,169 @@ function getChromiumPath() {
 
 // ─── Scraper ─────────────────────────────────────────────────────────────────
 
+function getBrowserLaunchArgs() {
+  return [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--window-size=1366,768",
+  ];
+}
+
+async function createStealthContext(browser) {
+  const context = await browser.newContext({
+    locale: "pt-BR",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 768 },
+    extraHTTPHeaders: {
+      "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+    },
+  });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, "languages", { get: () => ["pt-BR", "pt", "en-US", "en"] });
+    window.chrome = { runtime: {} };
+  });
+
+  // Injeta cookies de sessão do Facebook se configurados
+  const fbCookiesRaw = process.env.FB_COOKIES;
+  if (fbCookiesRaw) {
+    try {
+      const raw = JSON.parse(fbCookiesRaw);
+      // Suporta formato Cookie-Editor (array de objetos) e formato Netscape simplificado
+      const cookies = raw.map((c) => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain || ".facebook.com",
+        path: c.path || "/",
+        httpOnly: c.httpOnly ?? false,
+        secure: c.secure ?? true,
+        sameSite: c.sameSite === "no_restriction" ? "None"
+                : c.sameSite === "lax" ? "Lax"
+                : c.sameSite === "strict" ? "Strict"
+                : "None",
+        ...(c.expirationDate ? { expires: Math.floor(c.expirationDate) } : {}),
+      }));
+      await context.addCookies(cookies);
+      console.log(`[AUTH] ${cookies.length} cookies do Facebook injetados no contexto.`);
+    } catch (err) {
+      console.warn(`[AUTH] Falha ao parsear FB_COOKIES: ${err.message} — continuando sem autenticação.`);
+    }
+  } else {
+    console.warn("[AUTH] FB_COOKIES não definido — Playwright rodará sem sessão (pode falhar na Meta).");
+  }
+
+  return context;
+}
+
+async function extractCount(page) {
+  return await page.evaluate(() => {
+    const bodyText = document.body ? document.body.innerText : "";
+    let m = bodyText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    const elements = Array.from(document.querySelectorAll("div, span, h1, h2, h3, p, strong, b"));
+    for (const el of elements) {
+      const txt = el.innerText || "";
+      if (txt.length < 60 && /(?:~\s*)?[\d.,]+\s*(?:resultados|results)/i.test(txt)) {
+        const match = txt.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+        if (match) {
+          const n = parseInt(match[1].replace(/[,.]/g, ""), 10);
+          if (!Number.isNaN(n)) return n;
+        }
+      }
+    }
+
+    const docText = document.documentElement ? document.documentElement.innerText : "";
+    m = docText.match(/(?:~\s*)?([\d.,]+)\s*(?:resultados|results)/i);
+    if (m) {
+      const n = parseInt(m[1].replace(/[,.]/g, ""), 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    return null;
+  }).catch(() => null);
+}
+
+async function waitForCounter(page, maxWaitMs = 18000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const count = await extractCount(page);
+    if (count !== null) return count;
+    await page.evaluate(() => window.scrollBy(0, 100)).catch(() => {});
+    await page.waitForTimeout(1000);
+  }
+  return null;
+}
+
+function cleanMetaUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.hostname.includes("facebook.com") && u.searchParams.has("view_all_page_id") && u.searchParams.has("id")) {
+      u.searchParams.delete("id");
+      return u.toString();
+    }
+  } catch {}
+  return rawUrl;
+}
+
 async function scrapeWithContext(context, url) {
   const page = await context.newPage();
   try {
-    // PILAR 1: Interceptação de Rede (Network Blocking)
-    // Aborta o download de imagens, vídeos, css e fontes pesadas da Meta Ad Library para economizar 70% de RAM e CPU.
+    // Bloqueia APENAS imagens e mídias pesadas — NUNCA bloqueia CSS nem scripts
     await page.route("**/*", (route) => {
       const type = route.request().resourceType();
-      if (["image", "media", "font", "stylesheet"].includes(type)) {
+      if (["image", "media"].includes(type)) {
         route.abort();
       } else {
         route.continue();
       }
     });
 
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    const targetUrl = cleanMetaUrl(url);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 35000 });
 
-    // CORREÇÃO (v2): as URLs no formato /ads/library/?id=<ad_id> não abrem a busca
-    // diretamente — a Meta devolve uma página "casca" que redireciona via JS pro
-    // endereço real. A tag <meta http-equiv="refresh"> de fallback fica DENTRO de
-    // um <noscript> — e com JavaScript habilitado (nosso caso), o navegador NUNCA
-    // materializa o conteúdo de um <noscript> como DOM real, só como texto inerte.
-    // A v1 desta correção usava document.querySelector no DOM e por isso NUNCA
-    // encontrava a tag — o hop só "funcionava" enquanto o redirect via JS de
-    // verdade completava sozinho por conta própria. Agora extraímos a tag direto
-    // do HTML bruto (page.content(), que inclui o texto do noscript) via regex,
-    // sem depender do DOM — funciona esteja a tag dentro de um <noscript> ou não.
-    for (let hop = 0; hop < 3; hop++) {
-      const htmlAtual = await page.content().catch(() => "");
-      const metaTagMatch = htmlAtual.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*>/i);
-      if (!metaTagMatch) break;
-      const contentAttrMatch = metaTagMatch[0].match(/content=["']([^"']*)["']/i);
-      const urlPartMatch = contentAttrMatch ? contentAttrMatch[1].match(/url\s*=\s*(.+)$/i) : null;
-      if (!urlPartMatch) break;
-      // Entidades HTML (&amp; etc.) precisam ser decodificadas manualmente aqui —
-      // ao contrário de meta.getAttribute() num DOM real, regex sobre HTML bruto
-      // devolve o texto exatamente como está serializado, sem decodificar nada.
-      const refreshTarget = urlPartMatch[1]
-        .trim()
-        .replace(/^['"]|['"]$/g, "")
-        .replace(/&amp;/gi, "&")
-        .replace(/&quot;/gi, '"')
-        .replace(/&#0?39;/gi, "'");
-      if (!refreshTarget) break;
-      const nextUrlObj = new URL(refreshTarget, page.url());
-      // CORREÇÃO (v3): a URL de destino do <noscript> vem marcada com
-      // _fb_noscript=1 — o parâmetro que a própria Meta usa pra sinalizar
-      // "sirva a versão para cliente sem JavaScript". Nosso navegador roda JS
-      // normalmente; pedir essa URL como está devolve uma versão que não
-      // hidrata o número de resultados. Removemos o parâmetro pra pedir a
-      // versão completa, como um navegador comum pediria.
-      nextUrlObj.searchParams.delete("_fb_noscript");
-      const nextUrl = nextUrlObj.toString();
-      console.log(`[SCRAPE] hop=${hop} seguindo meta-refresh -> ${nextUrl}`);
+    let n = await waitForCounter(page, 18000);
+    if (n !== null) return n;
+
+    // Se o contador não apareceu e a URL foi limpa, tenta a original também
+    if (targetUrl !== url) {
+      console.log(`[SCRAPE] tentando URL alternativa: ${url}`);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35000 });
+      n = await waitForCounter(page, 12000);
+      if (n !== null) return n;
+    }
+
+    // Se ainda não encontrou, checa se tem redirect para outra URL que NÃO SEJA _fb_noscript
+    const html = await page.content();
+    const m = html.match(/<meta[^>]+http-equiv=["']refresh["'][^>]*content=["'][^"']*url\s*=\s*([^"'>]+)["']/i);
+    if (m && !m[1].includes("_fb_noscript")) {
+      const target = m[1].trim().replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+      const nextUrl = new URL(target, page.url()).toString();
+      console.log(`[SCRAPE] seguindo redirect válido: ${nextUrl}`);
       await page.goto(nextUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      n = await waitForCounter(page, 12000);
+      if (n !== null) return n;
     }
 
-    await page.waitForTimeout(15000);
-    const content = await page.content();
-    const htmlMatch = content.match(/([\d.,]+)\s*(resultados|results)/i);
-    if (htmlMatch) {
-      const parsed = parseInt(htmlMatch[1].replace(/[,.]/g, ""), 10);
-      if (!isNaN(parsed)) return parsed;
-    }
-    for (const kw of ["resultados", "results"]) {
-      try {
-        const el = page.locator(`text=/${kw}/i`).first();
-        await el.waitFor({ timeout: 3000 });
-        const texto = await el.innerText();
-        const match = texto.replace(/[,.]/g, "").match(/\d+/);
-        if (match) return parseInt(match[0], 10);
-      } catch {
-        continue;
-      }
-    }
-    const bodyText = (await page.textContent("body")) ?? "";
-    const textMatch = bodyText.match(/([\d.,]+)\s*(resultados|results)/i);
-    if (textMatch) {
-      const parsed = parseInt(textMatch[1].replace(/[,.]/g, ""), 10);
-      if (!isNaN(parsed)) return parsed;
-    }
+    // Log de diagnóstico
+    const pageTitle = await page.title().catch(() => "");
+    const bodySnippet = await page.evaluate(() => {
+      return (document.body ? document.body.innerText.slice(0, 300) : "").replace(/\s+/g, " ").trim();
+    }).catch(() => "");
+    console.warn(`[SCRAPE-DIAG] Falha na extração. Title: "${pageTitle}" | Conteúdo visto: "${bodySnippet}"`);
 
-    // DIAGNÓSTICO: antes disso retornava `null` sem motivo nenhum, e todo mundo
-    // virava "FALHA (motivo desconhecido)" no log — impossível saber se era bloqueio,
-    // captcha, cookie wall ou página vazia. Agora identificamos o sinal mais provável
-    // e jogamos isso pro log da próxima tentativa via exceção (falhaMotivo em processBatch).
-    const title = await page.title().catch(() => "");
-    // CORREÇÃO (v3): para checkpoint/captcha/login/cookie/página-vazia usamos
-    // innerText (texto VISÍVEL renderizado), não textContent — textContent
-    // inclui o conteúdo bruto de <script> (o bootstrap JS da Meta, cheio de
-    // nomes de módulo tipo "require") e de <noscript>, então qualquer uma
-    // dessas palavras aparecendo em JS invisível ou boilerplate oculto virava
-    // falso positivo (era exatamente isso que estava acontecendo — o title
-    // continuava "Biblioteca de Anúncios" nesses casos, prova de que não era
-    // bloqueio de verdade). bodyText (textContent) continua sendo usado só no
-    // fallback de "resultados" acima e na detecção de <meta refresh> ainda
-    // preso abaixo — essas duas precisam enxergar conteúdo não-visível, é
-    // assim que a tag do noscript é encontrada quando ainda presos na casca.
-    const visibleText = (await page.innerText("body").catch(() => "")) ?? "";
-    const lower = visibleText.toLowerCase();
-    const snippetBruto = bodyText.replace(/\s+/g, " ").trim().slice(0, 200);
-    const snippetVisivel = visibleText.replace(/\s+/g, " ").trim().slice(0, 200);
-    let motivo = `texto "resultados/results" não encontrado — title="${title}"`;
-    let snippet = snippetBruto;
-    // Checa o <meta refresh> ANTES do bloco de palavras-chave — continua sendo
-    // o sinal mais preciso de que ficamos presos numa página-casca.
-    if (/http-equiv=["']refresh["']/i.test(bodyText)) {
-      motivo = `preso numa página de redirecionamento (meta refresh) que não completou mesmo após seguir manualmente — title="${title}"`;
-    } else if (lower.includes("checkpoint") || lower.includes("captcha") || lower.includes("unusual activity") || lower.includes("atividade incomum")) {
-      motivo = `possível checkpoint/captcha de segurança da Meta — title="${title}"`;
-      snippet = snippetVisivel;
-    } else if (lower.includes("log in") || lower.includes("faça login") || lower.includes("entrar no facebook")) {
-      motivo = `possível bloqueio exigindo login — title="${title}"`;
-      snippet = snippetVisivel;
-    } else if (lower.includes("cookie") && (lower.includes("aceit") || lower.includes("accept"))) {
-      motivo = `possível cookie/consent wall bloqueando o conteúdo — title="${title}"`;
-      snippet = snippetVisivel;
-    } else if (visibleText.trim().length < 200) {
-      motivo = `página praticamente vazia (${visibleText.trim().length} chars de conteúdo visível) — possível bloqueio ou timeout de carregamento — title="${title}"`;
-      snippet = snippetVisivel;
-    }
-    throw new Error(`${motivo} | snippet="${snippet}"`);
+    return null;
   } finally {
     await page.close();
   }
@@ -310,14 +363,10 @@ async function scrapeAdCount(url, retries = 3) {
     const browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
     try {
-      const context = await browser.newContext({
-        locale: "pt-BR",
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-      });
+      const context = await createStealthContext(browser);
       const count = await scrapeWithContext(context, url);
       if (count !== null) {
         console.log(`[SCRAPE] attempt=${attempt} count=${count}`);
@@ -329,10 +378,10 @@ async function scrapeAdCount(url, retries = 3) {
     } finally {
       await browser.close();
     }
-    if (attempt < retries) await new Promise((r) => setTimeout(r, 5000));
+    if (attempt < retries) await new Promise((r) => setTimeout(r, 4000));
   }
-  console.error(`[SCRAPE] all ${retries} attempts failed, returning 0`);
-  return 0;
+  console.error(`[SCRAPE] all ${retries} attempts failed, returning null`);
+  return null;
 }
 
 // Dedupe considera slot — só bloqueia duplicata do MESMO slot
@@ -368,6 +417,10 @@ async function saveCount(slug, count, slot) {
 async function captureInicial(slug, url) {
   try {
     const count = await scrapeAdCount(url, 2);
+    if (count === null) {
+      console.warn(`[DESCOBERTA] slug=${slug} falhou, nada gravado`);
+      return null;
+    }
     await query(
       `UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`,
       [slug, count]
@@ -398,7 +451,8 @@ async function captureInicialWithContext(context, slug, url) {
       console.error(`[LOTE] slug=${slug} attempt=${attempt} error: ${err.message}`);
     }
   }
-  const final = count ?? 0;
+  if (count === null) return null;
+  const final = count;
   await query(`UPDATE pages SET inicial_count = COALESCE(inicial_count, $2) WHERE slug = $1`, [slug, final]);
   await query(
     `INSERT INTO scrape_latest (slug, ads_count, collected_at) VALUES ($1, $2, NOW())
@@ -433,13 +487,9 @@ async function runLote(itens) {
     browser = await chromium.launch({
       executablePath: getChromiumPath(),
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+      args: getBrowserLaunchArgs(),
     });
-    const context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
+    const context = await createStealthContext(browser);
 
     for (const item of itens) {
       loteStatus.atual = item.nome;
@@ -493,100 +543,8 @@ async function mirrorToSheet(rows) {
   }
 }
 
-function getCurrentSlot() {
-  const now = new Date();
-  const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 6) return 22;
-  if (hour >= 6 && hour < 15) return 3;
-  return 12;
-}
-
-async function processBatch(pages, slot) {
-  let browser;
-  let context;
-  const results = [];
-
-  async function launchBrowser() {
-    if (browser) await browser.close();
-    browser = await chromium.launch({
-      executablePath: getChromiumPath(),
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-    });
-    context = await browser.newContext({
-      locale: "pt-BR",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      extraHTTPHeaders: { "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8" },
-    });
-  }
-
-  try {
-    await launchBrowser(); // Início limpo
-
-    for (let i = 0; i < pages.length; i++) {
-      const p = pages[i];
-
-      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
-      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
-      let count = null;
-      let falhaMotivo = null;
-      if (!/^https?:\/\//i.test(p.url || "")) {
-        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
-        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
-      } else {
-        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
-          try {
-            count = await scrapeWithContext(context, p.url);
-          } catch (err) {
-            falhaMotivo = err.message;
-            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
-          }
-        }
-      }
-
-      // Coleta falhou de verdade (não achou o número, ou nem conseguiu abrir a página).
-      // NÃO salva 0 — isso viraria um dado falso no histórico. Só loga e pula o slug;
-      // ele será tentado de novo no próximo tick (mesmo slot, dentro da janela de 8h).
-      if (count === null) {
-        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
-        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
-        await new Promise(r => setTimeout(r, 1500));
-        continue;
-      }
-
-      if (slot !== null && slot !== undefined) {
-        await saveCount(p.slug, count, slot);
-      } else {
-        await query(
-          `INSERT INTO scrape_latest (slug, ads_count, collected_at)
-           VALUES ($1, $2, NOW())
-           ON CONFLICT (slug) DO UPDATE
-             SET ads_count    = EXCLUDED.ads_count,
-                 collected_at = EXCLUDED.collected_at`,
-          [p.slug, count]
-        );
-        console.log(`[LATEST] slug=${p.slug} count=${count} (manual — histórico preservado)`);
-      }
-
-      results.push({ slug: p.slug, nome: p.nome, count });
-
-      // Delay tático entre páginas
-      await new Promise(r => setTimeout(r, 1500));
-    }
-  } catch (err) {
-    console.error(`[BATCH] fatal error: ${err.message}`);
-  } finally {
-    if (browser) await browser.close();
-  }
-
-  const resultsOk = results.filter((r) => r.count !== null);
-  if (resultsOk.length > 0) {
-    await mirrorToSheet(resultsOk);
-  }
-  return results;
-}
-
 let isRunning = false;
+let blockedUntil = 0;
 
 let loteStatus = {
   emAndamento: false,
@@ -646,18 +604,129 @@ function parseLoteInput(texto) {
   return itens;
 }
 
+function getCurrentSlot() {
+  const now = new Date();
+  const hour = now.getUTCHours();
+  if (hour >= 1 && hour < 6) return 22;
+  if (hour >= 6 && hour < 15) return 3;
+  return 12;
+}
+
+async function processBatch(pages, slot) {
+  let browser;
+  let context;
+  const results = [];
+
+  async function launchBrowser() {
+    if (browser) await browser.close();
+    browser = await chromium.launch({
+      executablePath: getChromiumPath(),
+      headless: true,
+      args: getBrowserLaunchArgs(),
+    });
+    context = await createStealthContext(browser);
+  }
+
+  try {
+    await launchBrowser(); // Início limpo
+    
+    for (let i = 0; i < pages.length; i++) {
+      const p = pages[i];
+
+      // Sanity check: URL sem esquema (http/https) nunca vai carregar — nem tenta,
+      // pra não desperdiçar as 2 tentativas nem confundir o motivo da falha no log.
+      let count = null;
+      let falhaMotivo = null;
+      if (!/^https?:\/\//i.test(p.url || "")) {
+        falhaMotivo = `URL inválida (falta http/https): "${p.url}"`;
+        console.error(`[BATCH] slug=${p.slug} ${falhaMotivo}`);
+      } else {
+        for (let attempt = 1; attempt <= 2 && count === null; attempt++) {
+          try {
+            count = await scrapeWithContext(context, p.url);
+          } catch (err) {
+            falhaMotivo = err.message;
+            console.error(`[BATCH] slug=${p.slug} attempt=${attempt} error: ${err.message}`);
+          }
+        }
+      }
+
+      // FIX (fila travada / starvation do cron): registra a tentativa (sucesso OU
+      // falha) em pages.last_attempt_at. A query de /api/cron/tick agora ordena por
+      // esse campo (ASC NULLS FIRST), então uma página que acabou de falhar vai para
+      // o FIM da fila de pendentes do slot, dando vez às demais no próximo tick — em
+      // vez de a mesma página quebrada monopolizar o LIMIT 5 em todo ciclo.
+      await query(`UPDATE pages SET last_attempt_at = NOW(), last_status = $2 WHERE slug = $1`, [p.slug, count === null ? "falha_scraping" : "ok"]);
+
+      // Coleta falhou de verdade — NÃO salva 0 (isso viraria um dado falso no histórico).
+      // Só loga e pula o slug; será tentado de novo no próximo tick, mesmo slot, dentro
+      // da janela de 8h.
+      if (count === null) {
+        console.warn(`[BATCH] slug=${p.slug} FALHA na coleta (${falhaMotivo || "motivo desconhecido"}) — pulado, histórico preservado (sem gravar 0 falso)`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, falha: falhaMotivo || "falha desconhecida" });
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+
+      const final = count;
+
+      try {
+        if (slot !== null && slot !== undefined) {
+          await saveCount(p.slug, final, slot);
+        } else {
+          await query(
+            `INSERT INTO scrape_latest (slug, ads_count, collected_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (slug) DO UPDATE
+               SET ads_count = EXCLUDED.ads_count, collected_at = EXCLUDED.collected_at`,
+            [p.slug, final]
+          );
+          console.log(`[LATEST] slug=${p.slug} count=${final} (manual)`);
+        }
+        results.push({ slug: p.slug, nome: p.nome, count: final });
+      } catch (dbErr) {
+        console.error(`[BATCH] slug=${p.slug} count=${final} COLETOU MAS FALHOU AO GRAVAR NO BANCO: ${dbErr.message}`);
+        results.push({ slug: p.slug, nome: p.nome, count: null, dbError: true });
+      }
+
+      // Delay tático entre páginas
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  } catch (err) {
+    console.error(`[BATCH] fatal error: ${err.message}`);
+  } finally {
+    if (browser) await browser.close();
+  }
+
+  const resultsOk = results.filter((r) => r.count !== null);
+  if (resultsOk.length > 0) {
+    await mirrorToSheet(resultsOk);
+  }
+  return results;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/api/healthz", (_req, res) => res.json({ status: "ok", ts: new Date().toISOString() }));
 
 app.get("/api/cron/tick", async (req, res) => {
   res.json({ status: "alive", message: "Tick received" });
-
+  
   if (isRunning) return;
+  if (Date.now() < blockedUntil) return;
   isRunning = true;
-
+  
   try {
     const slot = getCurrentSlot();
+    // FIX (fila travada / starvation): ORDER BY p.last_attempt_at ASC NULLS FIRST
+    // garante rotação justa entre as páginas pendentes do slot. Sem isso, como a
+    // query não tinha ordenação explícita, o Postgres devolvia consistentemente as
+    // mesmas linhas (praticamente a ordem física da tabela) — então páginas que
+    // falham sempre (ex: bloqueio da Meta numa URL específica) nunca saíam do topo
+    // do resultado e ocupavam o LIMIT 5 inteiro em TODO tick, travando a coleta de
+    // qualquer outra página pendente daquele slot. Agora, toda página tentada
+    // (sucesso ou falha) vai pro fim da fila, e páginas nunca tentadas (NULL) vêm
+    // primeiro.
     const { rows: pages } = await query(`
       SELECT p.slug, p.nome, p.url
       FROM pages p
@@ -667,6 +736,7 @@ app.get("/api/cron/tick", async (req, res) => {
           AND sh.slot = $1 
           AND sh.collected_at >= NOW() - INTERVAL '8 hours'
       )
+      ORDER BY p.last_attempt_at ASC NULLS FIRST
       LIMIT 5;
     `, [slot]);
 
@@ -676,7 +746,13 @@ app.get("/api/cron/tick", async (req, res) => {
     }
 
     console.log(`[TICK] Iniciando lote de ${pages.length} paginas para o slot ${slot}...`);
-    await processBatch(pages, slot);
+    const results = await processBatch(pages, slot);
+    const metaSlugs = new Set(pages.filter(p => /facebook\.com\/ads\/library/.test(p.url)).map(p => p.slug));
+    const metaRes = results.filter(r => metaSlugs.has(r.slug));
+    if (metaRes.length >= 3 && metaRes.every(r => r.count === null && !r.dbError)) {
+      blockedUntil = Date.now() + 90 * 60 * 1000;
+      console.warn(`[TICK] ${metaRes.length}/${metaRes.length} páginas da Meta falharam — cooldown de 90 min (até ${new Date(blockedUntil).toISOString()})`);
+    }
     console.log(`[TICK] Lote do slot ${slot} finalizado.`);
   } catch (err) {
     console.error("[TICK] Erro geral:", err);
@@ -686,22 +762,22 @@ app.get("/api/cron/tick", async (req, res) => {
 });
 
 app.post("/api/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil, brand, ads_count_inicial } = req.body;
-  if (!nome || !url) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
+  const { nome, url: urlRaw, tipo, instagram_url, geo, nicho, funil, ads_count_inicial } = req.body;
+  if (!nome || !urlRaw) return res.status(400).json({ error: "Fields 'nome' and 'url' are required." });
+  const url = normalizeUrl(urlRaw);
   const slug = toSlug(nome);
   if (!slug) return res.status(400).json({ error: "Could not generate a valid slug." });
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
   await query(
-    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil, brand)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (slug) DO UPDATE
        SET nome=$2, url=$3, tipo=$4,
            instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
            geo=COALESCE(EXCLUDED.geo, pages.geo),
            nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
-           funil=COALESCE(EXCLUDED.funil, pages.funil),
-           brand=COALESCE(EXCLUDED.brand, pages.brand)`,
-    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, brand || null]
+           funil=COALESCE(EXCLUDED.funil, pages.funil)`,
+    [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
   );
   console.log(`[SALVAR] registered slug=${slug} tipo=${tipoFinal}`);
 
@@ -740,6 +816,7 @@ app.get("/api/coletar/:slug", async (req, res) => {
   if (!row) return res.status(404).type("text/plain").send(`Page '${slug}' not registered.`);
   try {
     const count = await scrapeAdCount(row.url);
+    if (count === null) return res.status(502).type("text/plain").send("FALHA");
     res.type("text/plain").send(String(count));
     await query(
       `INSERT INTO scrape_latest (slug, ads_count, collected_at)
@@ -752,18 +829,16 @@ app.get("/api/coletar/:slug", async (req, res) => {
     console.log(`[LATEST] slug=${slug} count=${count} (manual via /api/coletar — histórico preservado)`);
   } catch (err) {
     console.error(`[COLETAR] error slug=${slug}: ${err.message}`);
-    res.type("text/plain").send("0");
+    res.status(500).type("text/plain").send("FALHA");
   }
 });
 
 app.get("/api/coletar-tudo", async (_req, res) => {
-  res.json({ status: "started" });
-
   if (isRunning) {
-    console.warn("[RUN] coleta-tudo abortada — já existe uma coleta em andamento (cron ou outro lote)");
-    return;
+    return res.status(409).json({ status: "busy", message: "Já existe uma coleta em andamento (cron ou lote). Tente em alguns minutos." });
   }
   isRunning = true;
+  res.json({ status: "started" });
 
   (async () => {
     try {
@@ -831,7 +906,7 @@ app.get("/api/status", async (_req, res) => {
 });
 
 app.get("/api/paginas", async (_req, res) => {
-  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, brand FROM pages");
+  const { rows } = await query("SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil FROM pages");
   res.json(rows);
 });
 
@@ -839,7 +914,7 @@ app.get("/api/paginas", async (_req, res) => {
 
 app.get("/admin", async (_req, res) => {
   const { rows: pages } = await query(
-    "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, brand, created_at FROM pages ORDER BY tipo, created_at DESC"
+    "SELECT slug, nome, url, tipo, instagram_url, geo, nicho, funil, created_at FROM pages ORDER BY tipo, created_at DESC"
   );
 
   // JSON de cada item, embutido no atributo data-item, usado pelo JS para preencher o formulário ao clicar em Editar
@@ -853,7 +928,6 @@ app.get("/admin", async (_req, res) => {
       <td class="nome-cell">
         <div class="nome">${p.nome}</div>
         <div class="meta-badges">
-          ${p.brand ? `<span class="meta-tag" style="background:rgba(251,191,36,.12);color:#fbbf24">🏢 ${p.brand}</span>` : ""}
           ${p.geo ? `<span class="meta-tag">🌍 ${p.geo}</span>` : ""}
           ${p.nicho ? `<span class="meta-tag">🏷️ ${p.nicho}</span>` : ""}
           ${p.funil ? `<span class="meta-tag">🎯 ${p.funil}</span>` : ""}
@@ -873,7 +947,6 @@ app.get("/admin", async (_req, res) => {
           data-geo="${escAttr(p.geo)}"
           data-nicho="${escAttr(p.nicho)}"
           data-funil="${escAttr(p.funil)}"
-          data-brand="${escAttr(p.brand)}"
           onclick="editarItem(this)">✏️ Editar</button>
         <a href="/admin/funis/${p.slug}" class="btn-funis">🔀 Funis</a>
         <form method="POST" action="/admin/remover" style="display:inline" onsubmit="return confirm('Remover ${p.nome}?')">
@@ -902,7 +975,7 @@ app.get("/admin", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DTC Monitor — Admin</title>
+<title>Lowticket Monitor — Admin</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -916,8 +989,7 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-ser
 .form-row{display:grid;grid-template-columns:160px 1fr 1fr;gap:12px;align-items:end;margin-bottom:12px}
 .form-row-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
 .form-row-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}
-.form-row-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;margin-bottom:12px}
-@media(max-width:700px){.form-row,.form-row-2,.form-row-3,.form-row-4{grid-template-columns:1fr}}
+@media(max-width:700px){.form-row,.form-row-2,.form-row-3{grid-template-columns:1fr}}
 .field{display:flex;flex-direction:column;gap:6px}
 label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
 .label-optional{font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px;opacity:.7}
@@ -956,7 +1028,7 @@ td{padding:11px 14px;border-bottom:1px solid var(--border);vertical-align:middle
 </head>
 <body>
 <div class="hdr">
-  <h1>⚙️ Admin — DTC Monitor</h1>
+  <h1>⚙️ Admin — Lowticket Monitor</h1>
   <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
     <a href="/dashboard" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">← Ver Dashboard</a>
     <a href="/funis" style="font-size:13px;color:var(--accent);text-decoration:none;border:1px solid var(--accent);padding:7px 16px;border-radius:8px">🔀 Ver Mapa de Funis</a>
@@ -990,11 +1062,7 @@ ${msgOk}
     <hr class="divider">
     <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px">Informações adicionais <span style="font-weight:400;text-transform:none;letter-spacing:0;opacity:.6">(opcionais)</span></div>
 
-    <div class="form-row-4">
-      <div class="field">
-        <label>Brand (Marca) <span class="label-optional">opcional</span></label>
-        <input type="text" name="brand" id="brandInput" placeholder="Ex: My Nuora, Create Wellness">
-      </div>
+    <div class="form-row-3">
       <div class="field">
         <label>Instagram <span class="label-optional">opcional</span></label>
         <input type="url" name="instagram_url" id="instagramInput" placeholder="https://www.instagram.com/perfil">
@@ -1081,7 +1149,6 @@ function editarItem(btn){
   document.getElementById('instagramInput').value=btn.dataset.instagram;
   document.getElementById('geoInput').value=btn.dataset.geo;
   document.getElementById('nichoInput').value=btn.dataset.nicho;
-  document.getElementById('brandInput').value=btn.dataset.brand;
   document.getElementById('form-title').textContent='✏️ Editando: '+btn.dataset.nome;
   document.getElementById('submitBtn').textContent='Salvar alterações';
   document.getElementById('cancelBtn').style.display='inline-block';
@@ -1130,7 +1197,7 @@ function cancelarEdicao(){
 });
 
 app.post("/admin/salvar", async (req, res) => {
-  const { nome, url, tipo, instagram_url, geo, nicho, funil, brand, original_slug } = req.body;
+  const { nome, url, tipo, instagram_url, geo, nicho, funil, original_slug } = req.body;
   if (!nome || !url) return res.redirect("/admin?erro=campos-obrigatorios");
   const tipoFinal = tipo === "dominio" ? "dominio" : "pagina";
 
@@ -1139,8 +1206,8 @@ app.post("/admin/salvar", async (req, res) => {
   if (original_slug && original_slug.trim()) {
     try {
       const { rowCount } = await query(
-        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7, brand=$8 WHERE slug=$9`,
-        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, brand || null, original_slug.trim()]
+        `UPDATE pages SET nome=$1, url=$2, tipo=$3, instagram_url=$4, geo=$5, nicho=$6, funil=$7 WHERE slug=$8`,
+        [nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, original_slug.trim()]
       );
       if (rowCount === 0) {
         console.warn(`[ADMIN] edição falhou — slug=${original_slug} não encontrado`);
@@ -1159,16 +1226,15 @@ app.post("/admin/salvar", async (req, res) => {
   if (!slug) return res.redirect("/admin?erro=nome-invalido");
   try {
     await query(
-      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil, brand)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO pages (slug, nome, url, tipo, instagram_url, geo, nicho, funil)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (slug) DO UPDATE
          SET nome=$2, url=$3, tipo=$4,
              instagram_url=COALESCE(EXCLUDED.instagram_url, pages.instagram_url),
              geo=COALESCE(EXCLUDED.geo, pages.geo),
              nicho=COALESCE(EXCLUDED.nicho, pages.nicho),
-             funil=COALESCE(EXCLUDED.funil, pages.funil),
-             brand=COALESCE(EXCLUDED.brand, pages.brand)`,
-      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null, brand || null]
+             funil=COALESCE(EXCLUDED.funil, pages.funil)`,
+      [slug, nome, url, tipoFinal, instagram_url || null, geo || null, nicho || null, funil || null]
     );
     console.log(`[ADMIN] cadastrou slug=${slug} tipo=${tipoFinal}`);
     await captureInicial(slug, url);
@@ -1188,8 +1254,6 @@ app.post("/admin/remover", async (req, res) => {
   console.log(`[ADMIN] removeu slug=${slug}`);
   res.redirect("/admin?ok=removido");
 });
-
-
 
 app.post("/admin/lote", async (req, res) => {
   const { itens: textoItens } = req.body;
@@ -1959,10 +2023,12 @@ app.post("/admin/funis/remover-caminho", async (req, res) => {
 });
 
 app.post("/api/funis/salvar-node", async (req, res) => {
-  const { slug, tipo, rotulo, url, checkout_url } = req.body;
-  if (!slug || !tipo || !rotulo || !url) {
+  const { slug, tipo, rotulo, url: urlRaw, checkout_url: checkoutRaw } = req.body;
+  if (!slug || !tipo || !rotulo || !urlRaw) {
     return res.status(400).json({ error: "Missing required fields" });
   }
+  const url = normalizeUrl(urlRaw);
+  const checkout_url = checkoutRaw ? normalizeUrl(checkoutRaw) : checkoutRaw;
 
   try {
     // 1. Resolve ou cria o nó da Landing Page
@@ -2083,7 +2149,7 @@ app.get("/funis", async (_req, res) => {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Mapa de Funis — DTC Monitor</title>
+<title>Mapa de Funis — Lowticket Monitor</title>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--down:#fb7185}
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2154,7 +2220,7 @@ const IG_SVG = `<svg width="18" height="18" viewBox="0 0 24 24" xmlns="http://ww
 app.get("/dashboard", async (_req, res) => {
   try {
     const { rows: allPages } = await query(
-      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, brand FROM pages"
+      "SELECT slug, nome, url, tipo, created_at, inicial_count, instagram_url, geo, nicho, funil, last_attempt_at, last_status FROM pages"
     );
 
     const BR_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -2191,6 +2257,8 @@ app.get("/dashboard", async (_req, res) => {
           ultimaColeta: latestRow
             ? new Date(latestRow.collected_at).toISOString()
             : (hist.length ? new Date(hist[hist.length - 1].collected_at).toISOString() : null),
+          tentativa:    p.last_attempt_at ? new Date(p.last_attempt_at).toISOString() : null,
+          status:       p.last_status || null,
         };
 
         primeiraData[p.nome] = toBrDate(p.created_at).toISOString().slice(0, 10);
@@ -2205,7 +2273,6 @@ app.get("/dashboard", async (_req, res) => {
           geo:           p.geo || null,
           nicho:         p.nicho || null,
           funil:         p.funil || null,
-          brand:         p.brand || null,
         };
 
         paginas[p.nome] = {};
@@ -2300,7 +2367,7 @@ app.get("/dashboard", async (_req, res) => {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DTC Monitor</title>
+<title>Lowticket Monitor</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"><\/script>
 <style>
 :root{--bg:#0a0a14;--surface:#12121f;--surface2:#171728;--border:#23233f;--text:#f0f0fa;--text2:#b8b8d0;--muted:#7a7a98;--accent:#7c6fff;--up:#34d399;--up2:#10b981;--down:#fb7185;--flat:#8888aa;--hot:#a78bfa}
@@ -2359,7 +2426,6 @@ td{padding:11px 16px;border-top:1px solid var(--border);color:var(--text2);white
 tbody tr:hover td{background:var(--surface2)}
 .t-name{font-weight:600;color:#fff;white-space:normal}
 .t-name-main{display:block;font-weight:600;color:#fff;margin-bottom:4px}
-.t-brand{font-weight:600;color:#fbbf24;white-space:nowrap}
 .t-meta-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
 .t-geo-badge{font-size:10px;background:rgba(34,211,238,.1);color:#22d3ee;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
 .t-nicho-badge{font-size:10px;background:rgba(167,139,250,.12);color:#a78bfa;padding:2px 7px;border-radius:5px;font-weight:500;white-space:nowrap}
@@ -2427,7 +2493,7 @@ tbody tr:hover td{background:var(--surface2)}
 
 <div class="hdr">
   <div>
-    <h1>📊 DTC Monitor</h1>
+    <h1>📊 Lowticket Monitor</h1>
     <div class="hdr-sub" id="upd"></div>
   </div>
   <div style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px">
@@ -2463,7 +2529,7 @@ tbody tr:hover td{background:var(--surface2)}
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Brand (Marca)</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>#</th><th>Bibliotecas</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
       <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="pag_tbody"></tbody>
@@ -2496,7 +2562,7 @@ tbody tr:hover td{background:var(--surface2)}
 <div class="tbl-panel">
   <table>
     <thead><tr>
-      <th>#</th><th>Brand (Marca)</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
+      <th>#</th><th>Domínios</th><th>Descoberta</th><th>Inicial</th><th>Atual</th><th>Última Checagem</th>
       <th>Δ Total</th><th>Tendência</th><th>Participação</th><th>3 dias</th><th>Instagram</th>
     </tr></thead>
     <tbody id="dom_tbody"></tbody>
@@ -2521,6 +2587,7 @@ ${adsPaginas.length === 0
 <div style="height:36px"></div>
 
 <div class="group-title">📅 Histórico de Coletas</div>
+
 
 <div class="accordion-wrap">
   <button class="accordion-btn" onclick="toggleAccordion('pag_hist-section','pag_acc-icon')">
@@ -2657,11 +2724,6 @@ porAds.forEach((pag,idx)=>{
   const metaBadgesHtml=(geoBadge||nichoBadge||funilBadge)?'<div class="t-meta-badges">'+geoBadge+nichoBadge+funilBadge+'</div>':'';
   const nomeCell='<span class="t-name-main"><a href="'+(ultima[pag]?.url||'#')+'" target="_blank" rel="noopener" class="lib-link">'+pag+'</a></span>'+metaBadgesHtml;
 
-  // Célula de Brand (Marca)
-  const brandCell=m.brand
-    ?'<span class="t-brand" style="color:#fbbf24;font-weight:700">🏢 '+m.brand+'</span>'
-    :'<span style="color:var(--muted)">—</span>';
-
   // Célula do Instagram
   const igCell=m.instagram_url
     ?'<a href="'+m.instagram_url+'" target="_blank" rel="noopener" class="ig-link" title="Ver Instagram">'+IG_SVG+'</a>'
@@ -2670,13 +2732,13 @@ porAds.forEach((pag,idx)=>{
   const tr=document.createElement("tr");
   tr.innerHTML=
     '<td class="mono" data-label="#" style="color:var(--muted)">'+(idx+1)+'</td>'
-    +'<td class="t-brand" data-label="Marca">'+brandCell+'</td>'
     +'<td class="t-name" data-label="Nome">'+nomeCell+'</td>'
     +'<td data-label="Descoberta" style="color:var(--muted)">'+did+'</td>'
     +'<td class="mono" data-label="Inicial">'+x.ini+'</td>'
     +'<td class="mono" data-label="Atual" style="color:#fff;font-weight:600">'+x.at+'</td>'
     +'<td data-label="Últ. Checagem" style="color:var(--muted);font-family:Space Mono,monospace;font-size:11px">'
     +(ultima[pag]?.ultimaColeta?new Date(ultima[pag].ultimaColeta).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}):'—')
+    +(ultima[pag]?.status==='falha_scraping'&&ultima[pag]?.tentativa?'<div style="color:#fb7185;font-size:10px">tentou '+new Date(ultima[pag].tentativa).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})+' · falhou</div>':'')
     +'</td>'
     +'<td class="mono" data-label="Δ Total" style="color:'+(x.vn>0?"#34d399":x.vn<0?"#fb7185":"#888")+'">'+(x.vn>=0?"+":"")+x.vn+'</td>'
     +'<td data-label="Tendência"><span class="badge '+x.cls+'">'+x.label+'</span></td>'
