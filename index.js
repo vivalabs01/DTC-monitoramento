@@ -2406,12 +2406,18 @@ body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',system-u
 .acc-icon.open{transform:rotate(180deg)}
 .accordion-body{display:none;padding:0 18px 16px;overflow-x:auto;-webkit-overflow-scrolling:touch}
 .accordion-body.open{display:block}
-.grid-charts{display:grid;grid-template-columns:380px 1fr;gap:14px;margin-bottom:26px}
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+.grid-charts{display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:26px}
+@media(min-width:1100px){.grid-charts{grid-template-columns:380px 1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;min-width:0}
 .panel-title{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.rosca-wrap{display:flex;gap:16px;align-items:center}
-.rosca-canvas{width:150px;height:150px;position:relative;flex-shrink:0}
-.legend{display:flex;flex-direction:column;gap:7px;flex:1;min-width:0}
+.rosca-wrap{display:flex;flex-direction:column;gap:16px;align-items:center;min-width:0}
+@media(min-width:900px){.rosca-wrap{flex-direction:row}}
+.rosca-canvas{width:clamp(120px,40vw,150px);height:clamp(120px,40vw,150px);position:relative;flex-shrink:0}
+.legend{display:flex;flex-direction:column;gap:7px;flex:1;min-width:0;max-height:260px;overflow-y:auto;padding-right:14px;scrollbar-gutter:stable}
+.legend::-webkit-scrollbar{width:6px}
+.legend::-webkit-scrollbar-track{background:transparent}
+.legend::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
+.legend::-webkit-scrollbar-thumb:hover{background:var(--muted)}
 .leg-item{display:flex;align-items:center;gap:9px}
 .leg-dot{width:10px;height:10px;border-radius:3px;flex-shrink:0}
 .leg-name{font-size:12px;color:var(--text);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2472,7 +2478,6 @@ tbody tr:hover td{background:var(--surface2)}
   .hdr-admin-btn{width:100%;justify-content:center;box-sizing:border-box}
   .hdr h1{font-size:15px}
   .hdr-sub{font-size:10px}
-  .scaling-strip{grid-template-columns:1fr 1fr}
   .scale-card-val{font-size:24px}
   .grid-charts{grid-template-columns:1fr}
   .rosca-wrap{flex-direction:column;align-items:flex-start}
